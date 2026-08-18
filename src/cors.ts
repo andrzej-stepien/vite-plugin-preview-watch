@@ -11,6 +11,8 @@ export interface CorsOptionsLike {
 
 export type PreviewCors = boolean | CorsOptionsLike | null | undefined;
 
+type HeaderValue = string | number | string[];
+
 function originMatches(
   origin: string | RegExp | unknown,
   requestOrigin: string,
@@ -69,4 +71,59 @@ export function resolveCorsHeaders(
     headers["Access-Control-Allow-Credentials"] = "true";
   }
   return headers;
+}
+
+/**
+ * Combines configured preview headers with dynamic CORS headers. `Vary` is
+ * special: it is a comma-separated list, so a dynamic `Vary: Origin` must be
+ * appended instead of replacing a value from `preview.headers`.
+ */
+export function mergeResponseHeaders(
+  previewHeaders: Record<string, HeaderValue>,
+  corsHeaders: Record<string, string>,
+): Record<string, HeaderValue> {
+  const headers: Record<string, HeaderValue> = { ...previewHeaders };
+
+  const varyNames = Object.keys(headers).filter(
+    (headerName) => headerName.toLowerCase() === "vary",
+  );
+  const canonicalVaryName = varyNames[0];
+  if (canonicalVaryName !== undefined) {
+    const existingVaryValues = varyNames.map((name) => headers[name]);
+    for (const name of varyNames.slice(1)) delete headers[name];
+    headers[canonicalVaryName] = mergeVaryHeaders(existingVaryValues);
+  }
+
+  for (const [name, value] of Object.entries(corsHeaders)) {
+    if (name.toLowerCase() !== "vary") {
+      headers[name] = value;
+      continue;
+    }
+
+    const targetName = canonicalVaryName ?? name;
+    headers[targetName] = mergeVaryHeaders([headers[targetName], value]);
+  }
+
+  return headers;
+}
+
+function mergeVaryHeaders(valuesToMerge: Array<HeaderValue | undefined>): string {
+  const values = valuesToMerge
+    .filter((value): value is HeaderValue => value !== undefined)
+    .flatMap((value) => (Array.isArray(value) ? value : [value]))
+    .flatMap((value) => String(value).split(","))
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (values.some((value) => value === "*")) return "*";
+
+  const seen = new Set<string>();
+  return values
+    .filter((value) => {
+      const normalized = value.toLowerCase();
+      if (seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    })
+    .join(", ");
 }

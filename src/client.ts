@@ -13,6 +13,12 @@ export function joinClientUrl(base: string, clientPath: string): string {
 /** Client behaviour on a successful rebuild. */
 export type ClientMode = "auto" | "manual";
 
+interface ClientBuildState {
+  serverId: string;
+  revision: number;
+  error: string | null;
+}
+
 const OVERLAY_STYLE =
   "position:fixed;inset:0;z-index:2147483647;margin:0;padding:24px;" +
   "background:rgba(20,20,20,.95);color:#ff5555;" +
@@ -43,11 +49,11 @@ const RELOAD_BUTTON_STYLE =
  * - `build-error`: show a full-screen overlay with the build error (custom
  *   event name so it is not confused with EventSource's built-in `error`
  *   event, which fires on connection drops);
- * - reconnection (an `open` after the connection previously dropped): the
- *   server restarted and the bundle may have changed while we were not
- *   listening - reload in `auto` mode, toast in `manual` mode. Disabled when
- *   `reconnect` is `false`, so a deliberately restarted preview server does not
- *   trigger reloads.
+ * - reconnection (an `open` after the connection previously dropped): reload
+ *   only when the server instance changed or a build completed while we were
+ *   disconnected. This avoids a false reload after a transient SSE/proxy
+ *   disconnect. Disabled when `reconnect` is `false`, so a deliberately
+ *   restarted preview server does not trigger reloads.
  *
  * The build-error overlay carries a small "Reload" button in its corner
  * (`data-vite-preview-watch-reload`) so the user can force a reload without the
@@ -57,13 +63,15 @@ const RELOAD_BUTTON_STYLE =
  *
  * @param url       Absolute URL of the SSE endpoint.
  * @param mode      Client behaviour on a successful rebuild.
- * @param reconnect Whether an `open` after a dropped connection should reload
- *                  (or toast). Defaults to `true`.
+ * @param reconnect Whether a reconnect with a changed server/build state should
+ *                  reload (or toast). Defaults to `true`.
+ * @param initialState Build state associated with the served HTML document.
  */
 export function renderClientScript(
   url: string,
   mode: ClientMode,
   reconnect = true,
+  initialState: ClientBuildState | null = null,
 ): string {
   return (
     `<script type="module">` +
@@ -71,7 +79,8 @@ export function renderClientScript(
     `const s=new EventSource(${JSON.stringify(url)});` +
     `const manual=${JSON.stringify(mode === "manual")};` +
     `const reconnect=${JSON.stringify(reconnect)};` +
-    `let box,toast,wasOpen=false;` +
+    `const initial=${JSON.stringify(initialState)};` +
+    `let box,toast,wasOpen=false,pendingReconnect=false,hasReady=initial!==null,serverId=initial?initial.serverId:null,revision=initial?initial.revision:-1;` +
     `const clearBox=()=>{if(box){box.remove();box=null;}};` +
     `const clearToast=()=>{if(toast){toast.remove();toast=null;}};` +
     `const root=()=>document.body||document.documentElement;` +
@@ -84,12 +93,8 @@ export function renderClientScript(
     `toast.addEventListener("click",()=>location.reload());` +
     `root().appendChild(toast);` +
     `};` +
-    `const onFresh=()=>{if(manual){clearBox();showToast();}else{location.reload();}};` +
-    `s.addEventListener("reload",onFresh);` +
-    `s.addEventListener("open",()=>{if(wasOpen&&reconnect)onFresh();wasOpen=true;});` +
-    `s.addEventListener("build-error",(e)=>{` +
+    `const showError=(msg)=>{` +
     `clearBox();clearToast();` +
-    `let msg="Build failed";try{msg=JSON.parse(e.data).message||msg;}catch(_){}` +
     `box=document.createElement("pre");` +
     `box.setAttribute("data-vite-preview-watch-error","");` +
     `box.style.cssText=${JSON.stringify(OVERLAY_STYLE)};` +
@@ -101,6 +106,34 @@ export function renderClientScript(
     `btn.addEventListener("click",()=>location.reload());` +
     `box.appendChild(btn);` +
     `root().appendChild(box);` +
+    `};` +
+    `if(initial&&typeof initial.error==="string")showError(initial.error);` +
+    `const onFresh=()=>{if(manual){clearBox();showToast();}else{location.reload();}};` +
+    `const parseState=(e)=>{` +
+    `try{const v=JSON.parse(e.data);` +
+    `if(typeof v.serverId==="string"&&Number.isInteger(v.revision))return v;` +
+    `}catch(_){}return null;` +
+    `};` +
+    `s.addEventListener("reload",(e)=>{` +
+    `const v=parseState(e);` +
+    `if(v){if(v.serverId===serverId&&v.revision<=revision)return;serverId=v.serverId;revision=v.revision;}` +
+    `onFresh();` +
+    `});` +
+    `s.addEventListener("error",()=>{if(!wasOpen)pendingReconnect=true;});` +
+    `s.addEventListener("open",()=>{if(wasOpen)pendingReconnect=true;wasOpen=true;});` +
+    `s.addEventListener("ready",(e)=>{` +
+    `const v=parseState(e);` +
+    `if(!v)return;` +
+    `const stateChanged=hasReady&&(v.serverId!==serverId||v.revision!==revision);` +
+    `const shouldRefresh=stateChanged&&(pendingReconnect?reconnect:true);` +
+    `serverId=v.serverId;revision=v.revision;pendingReconnect=false;` +
+    `hasReady=true;` +
+    `if(typeof v.error==="string")showError(v.error);else if(v.error===null)clearBox();` +
+    `if(shouldRefresh)onFresh();` +
+    `});` +
+    `s.addEventListener("build-error",(e)=>{` +
+    `let msg="Build failed";try{msg=JSON.parse(e.data).message||msg;}catch(_){}` +
+    `showError(msg);` +
     `});` +
     `})();` +
     `</script>`

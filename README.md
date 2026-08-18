@@ -65,12 +65,11 @@ On `vite preview` startup the plugin:
 4. When a rebuild fails, pushes a `build-error` event; the client shows a
    full-screen overlay with the error (plugin, message, file location, and code
    frame). The overlay clears on the next successful rebuild.
-5. If the SSE connection drops and later reconnects (for example after the
-   preview server restarts, when the bundle may have changed while the tab was
-   not listening), the client treats it like a fresh rebuild - auto-reloading in
-   the default mode, or showing the toast in `manual` mode. Set `reconnect:
-   false` to turn this off, so a preview server that is deliberately restarted
-   often does not reload open tabs.
+5. If the SSE connection drops and later reconnects, the client compares the
+   server instance and build revision before deciding whether to refresh. A
+   transient proxy disconnect therefore does not reload an unchanged page; a
+   server restart or build completed while disconnected still does. Set
+   `reconnect: false` to turn reconnect refreshes off completely.
 
 The build-error overlay carries a small "Reload" button in its top-right corner
 so you can force a reload without opening the DevTools console. The error text
@@ -107,11 +106,10 @@ previewWatch({
   // when reload is false. The overlay includes a small "Reload" button.
   overlay: true,
 
-  // React to SSE reconnection after a dropped connection. true treats a
-  // reconnect as a fresh rebuild (reload / toast) because the server may have
-  // restarted with a changed bundle; false makes reconnection a no-op - handy
-  // when the preview server is restarted often on purpose. No effect when
-  // reload is false.
+  // React to SSE reconnection after a dropped connection only when the server
+  // instance or build revision changed. false makes reconnection a no-op -
+  // handy when the preview server is restarted often on purpose. No effect
+  // when reload is false.
   reconnect: true,
 
   // Path (relative to `base`) of the internal SSE endpoint. Change only on a
@@ -154,6 +152,8 @@ previewWatch({
 - Function-style `preview.cors.origin` is not supported: the plugin's own
   responses cannot call it synchronously, so they carry no CORS headers in that
   configuration.
+- The background Rollup watcher follows source/module changes. Changes made
+  directly by an external process inside `dist/` are not watched.
 
 ## License
 
