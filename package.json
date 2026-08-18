@@ -1,6 +1,6 @@
 {
   "name": "vite-plugin-preview-watch",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Watch mode for `vite preview` - rebuilds the production bundle on source changes and full-page reloads open preview tabs.",
   "keywords": [
     "vite",

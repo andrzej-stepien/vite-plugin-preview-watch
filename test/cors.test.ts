@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveCorsHeaders } from "../src/cors";
+import { mergeResponseHeaders, resolveCorsHeaders } from "../src/cors";
 
 describe("resolveCorsHeaders", () => {
   it("returns empty object for false", () => {
@@ -134,5 +134,49 @@ describe("resolveCorsHeaders", () => {
 
   it("returns empty for { origin: false }", () => {
     expect(resolveCorsHeaders({ origin: false }, "http://a.example")).toEqual({});
+  });
+});
+
+describe("mergeResponseHeaders", () => {
+  it("adds Origin to an existing Vary header", () => {
+    expect(
+      mergeResponseHeaders(
+        { Vary: "Accept-Encoding" },
+        { "Access-Control-Allow-Origin": "http://a.example", Vary: "Origin" },
+      ),
+    ).toEqual({
+      "Access-Control-Allow-Origin": "http://a.example",
+      Vary: "Accept-Encoding, Origin",
+    });
+  });
+
+  it("recognizes Vary case-insensitively and avoids duplicate tokens", () => {
+    expect(
+      mergeResponseHeaders(
+        { vary: ["Origin", "Accept-Encoding"] },
+        { Vary: "origin" },
+      ),
+    ).toEqual({ vary: "Origin, Accept-Encoding" });
+  });
+
+  it("collapses all case-insensitive Vary keys before merging CORS", () => {
+    expect(
+      mergeResponseHeaders(
+        {
+          Vary: "Accept-Encoding",
+          vary: ["User-Agent", "origin"],
+          VARY: "Accept-Encoding",
+        },
+        { Vary: "Origin" },
+      ),
+    ).toEqual({
+      Vary: "Accept-Encoding, User-Agent, origin",
+    });
+  });
+
+  it("keeps Vary wildcard unchanged", () => {
+    expect(
+      mergeResponseHeaders({ Vary: "*" }, { Vary: "Origin" }),
+    ).toEqual({ Vary: "*" });
   });
 });

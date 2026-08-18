@@ -2,14 +2,18 @@
 import { resolve } from "node:path";
 import type { ServerResponse } from "node:http";
 import { build } from "vite";
-import type { Plugin, PreviewServer, Rollup } from "vite";
+import type { Plugin, Rollup } from "vite";
 import { joinClientUrl, renderClientScript } from "./client";
-import { resolveCorsHeaders, type PreviewCors } from "./cors";
+import { mergeResponseHeaders, resolveCorsHeaders, type PreviewCors } from "./cors";
 import { formatBuildError } from "./error";
 import { injectSnippet, isSpaAppType, resolveHtmlFile, stripBase } from "./inject";
 import { resolveOptions, type PreviewWatchOptions } from "./options";
 
 const PLUGIN_NAME = "vite-plugin-preview-watch";
+
+function createServerId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
 
 /**
  * Vite plugin that adds a watch mode to `vite preview`: it rebuilds the output
@@ -41,7 +45,7 @@ export function previewWatch(options: PreviewWatchOptions = {}): Plugin {
     // recursion and no duplicate work.
     apply: "serve",
 
-    async configurePreviewServer(server: PreviewServer) {
+    async configurePreviewServer(server) {
       const config = server.config;
       const base = config.base;
       const outDirAbs = resolve(config.root, config.build.outDir);
@@ -75,6 +79,8 @@ export function previewWatch(options: PreviewWatchOptions = {}): Plugin {
 
       // ---- reload wiring -------------------------------------------------
       const clients = new Set<ServerResponse>();
+      const serverId = createServerId();
+      let buildRevision = 0;
 
       const send = (event: string, data?: unknown): void => {
         const payload = data === undefined ? "{}" : JSON.stringify(data);
@@ -90,6 +96,7 @@ export function previewWatch(options: PreviewWatchOptions = {}): Plugin {
       let buildFailed = false;
       let cycleStart = 0;
       let lastError: unknown = null;
+      let currentBuildError: string | null = null;
       watcher.on("event", (event) => {
         switch (event.code) {
           case "START":
@@ -105,19 +112,25 @@ export function previewWatch(options: PreviewWatchOptions = {}): Plugin {
           case "ERROR":
             buildFailed = true;
             lastError = event.error;
+            const formattedError = formatBuildError(event.error);
+            currentBuildError = opts.overlay ? formattedError : null;
             // ERROR events can also carry a (partial) build result to close.
             void event.result?.close();
             // Keep the preview alive and surface the failure in the browser.
             // Vite still logs the full error to the terminal itself.
             if (opts.reload && opts.overlay) {
-              send("build-error", { message: formatBuildError(event.error) });
+              send("build-error", { message: formattedError });
             }
             break;
           case "END":
             // Successful (re)build: reload, which also clears any overlay. In
             // manual mode we still emit "reload" - the client shows a toast
             // instead of reloading, so the decision stays client-side.
-            if (opts.reload && !buildFailed) send("reload");
+            if (opts.reload && !buildFailed) {
+              currentBuildError = null;
+              buildRevision += 1;
+              send("reload", { serverId, revision: buildRevision });
+            }
             // Fire the server-side hook after every cycle, regardless of the
             // reload setting. A user exception here must not take down the
             // preview server.
@@ -137,11 +150,8 @@ export function previewWatch(options: PreviewWatchOptions = {}): Plugin {
       });
 
       if (opts.reload) {
-        const snippet = renderClientScript(
-          joinClientUrl(base, opts.clientPath),
-          opts.reload === "manual" ? "manual" : "auto",
-          opts.reconnect,
-        );
+        const clientUrl = joinClientUrl(base, opts.clientPath);
+        const clientMode = opts.reload === "manual" ? "manual" : "auto";
 
         // SSE endpoint the injected client subscribes to.
         server.middlewares.use((req, res, next) => {
@@ -156,13 +166,15 @@ export function previewWatch(options: PreviewWatchOptions = {}): Plugin {
             req.headers.origin,
           );
           res.writeHead(200, {
-            ...previewHeaders,
-            ...corsHeaders,
+            ...mergeResponseHeaders(previewHeaders, corsHeaders),
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache, no-transform",
             Connection: "keep-alive",
           });
           res.write("retry: 1000\n\n");
+          res.write(
+            `event: ready\ndata: ${JSON.stringify({ serverId, revision: buildRevision, error: currentBuildError })}\n\n`,
+          );
           clients.add(res);
 
           // Comment pings keep proxies from dropping the idle connection.
@@ -192,18 +204,23 @@ export function previewWatch(options: PreviewWatchOptions = {}): Plugin {
             return next();
           }
 
+          const snippet = renderClientScript(
+            clientUrl,
+            clientMode,
+            opts.reconnect,
+            { serverId, revision: buildRevision, error: currentBuildError },
+          );
           const body = injectSnippet(html, snippet);
           res.statusCode = 200;
           // Mirror the preview server's configured response headers and CORS,
           // then set our own content-type/cache last so they win.
-          for (const [name, value] of Object.entries(previewHeaders)) {
-            res.setHeader(name, value);
-          }
           const corsHeaders = resolveCorsHeaders(
             config.preview.cors as PreviewCors,
             req.headers.origin,
           );
-          for (const [name, value] of Object.entries(corsHeaders)) {
+          for (const [name, value] of Object.entries(
+            mergeResponseHeaders(previewHeaders, corsHeaders),
+          )) {
             res.setHeader(name, value);
           }
           res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -213,12 +230,62 @@ export function previewWatch(options: PreviewWatchOptions = {}): Plugin {
       }
 
       // ---- teardown ------------------------------------------------------
-      const close = (): void => {
-        void watcher.close();
-        for (const client of clients) client.end();
-        clients.clear();
+      let closePromise: Promise<void> | null = null;
+      const closeResources = (): Promise<void> => {
+        if (closePromise === null) {
+          for (const client of clients) client.end();
+          clients.clear();
+          closePromise = Promise.resolve()
+            .then(() => watcher.close())
+            .then(() => undefined);
+        }
+        return closePromise;
       };
-      server.httpServer.once("close", close);
+      server.httpServer.once("close", () => {
+        void closeResources().catch((error) => {
+          console.error(`[${PLUGIN_NAME}] failed to close watcher:`, error);
+        });
+      });
+
+      const closableServer = server as typeof server & {
+        close?: () => Promise<void> | void;
+      };
+      const originalClose = closableServer.close;
+      let serverClosePromise: Promise<void> | null = null;
+      if (typeof originalClose === "function") {
+        const boundClose = originalClose.bind(server);
+        closableServer.close = () => {
+          serverClosePromise ??= (async () => {
+            // End SSE streams before Vite starts closing its HTTP server.
+            // Otherwise Node waits for those keep-alive clients forever.
+            const resources = closeResources();
+            try {
+              await boundClose();
+            } finally {
+              await resources;
+            }
+          })();
+          return serverClosePromise;
+        };
+      } else {
+        closableServer.close = () => {
+          serverClosePromise ??= (async () => {
+            // Vite 4 has no PreviewServer.close(). Close our long-lived SSE
+            // responses first, then wait for the underlying HTTP close.
+            const resources = closeResources();
+            try {
+              await new Promise<void>((resolve, reject) => {
+                server.httpServer.close((error) =>
+                  error ? reject(error) : resolve(),
+                );
+              });
+            } finally {
+              await resources;
+            }
+          })();
+          return serverClosePromise;
+        };
+      }
     },
   };
 }
